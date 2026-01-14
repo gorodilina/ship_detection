@@ -1,7 +1,9 @@
 streamlit 
 rasterio 
 pillow 
+opencv-python-headless
 ultralytics 
 numpy 
 folium 
 streamlit-folium 
+
