@@ -6,6 +6,7 @@ ultralytics
 numpy 
 folium 
 streamlit-folium 
-skimagescikit-image
+scikit-image
 tqdm
+
 
