@@ -2,6 +2,8 @@ import streamlit as st
 import rasterio
 from rasterio.transform import xy
 import numpy as np
+import cv2
+import shutil
 from PIL import Image, ImageDraw
 from ultralytics import YOLO
 import json
@@ -11,6 +13,78 @@ from streamlit_folium import st_folium
 from folium.plugins import MousePosition
 
 st.set_page_config(page_title="SAR Analysis", layout="wide")
+def prepare_sar_for_yolo(raw, nodata=None):
+    """
+    Преобразует первый SAR-канал в контрастное RGB-изображение uint8:
+    комплексная амплитуда -> asinh -> процентили -> CLAHE.
+    """
+
+    # Sentinel-1 SLC содержит комплексные значения I + jQ.
+    if np.iscomplexobj(raw):
+        arr = np.abs(raw).astype(np.float32, copy=False)
+        nodata_value = abs(nodata) if nodata is not None else None
+    else:
+        arr = raw.astype(np.float32, copy=False)
+        nodata_value = nodata
+
+    # Маска некорректных пикселей.
+    invalid = ~np.isfinite(arr)
+    if nodata_value is not None:
+        invalid |= np.isclose(arr, nodata_value)
+
+    # Для расчёта статистики используем каждый восьмой пиксель.
+    sample = arr[::8, ::8]
+    sample_valid = sample[~invalid[::8, ::8]]
+
+    if sample_valid.size == 0:
+        raise ValueError("В TIFF нет валидных пикселей")
+
+    # Характерный уровень яркости.
+    positive = sample_valid[sample_valid > 0]
+    scale_source = positive if positive.size else np.abs(sample_valid)
+    scale = float(np.percentile(scale_source, 50))
+
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+
+    # Сжатие динамического диапазона SAR.
+    arr[invalid] = 0.0
+    arr /= scale
+    np.arcsinh(arr, out=arr)
+
+    stretched_sample = arr[::8, ::8][~invalid[::8, ::8]]
+    lo, hi = np.percentile(stretched_sample, [0.5, 99.5])
+
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise ValueError(
+            f"Некорректный диапазон яркости: lo={lo}, hi={hi}"
+        )
+
+    # Перевод в диапазон 0–255.
+    arr -= lo
+    arr /= max(float(hi - lo), 1e-6)
+    np.clip(arr, 0.0, 1.0, out=arr)
+    arr *= 255.0
+    arr[invalid] = 0.0
+
+    base = arr.astype(np.uint8, copy=False)
+
+    # Локальное повышение контраста.
+    clahe = cv2.createCLAHE(
+        clipLimit=1.6,
+        tileGridSize=(16, 16)
+    )
+    local = clahe.apply(base)
+
+    display = cv2.addWeighted(
+        local, 0.70,
+        base, 0.30,
+        0
+    )
+    display[invalid] = 0
+
+    # YOLO ожидает трёхканальное изображение.
+    return np.repeat(display[:, :, None], 3, axis=2)
 
 # ===== БОКОВАЯ ПАНЕЛЬ С ВЫБОРОМ РЕЖИМА =====
 st.sidebar.title("🧭 Навигация")
@@ -123,24 +197,20 @@ if mode == "🚢 Детекция кораблей":
         
         def process_geotiff(geotiff_path, model, conf_threshold, tile_size, overlap):
             with rasterio.open(geotiff_path) as src:
-                img_array = src.read()
                 transform = src.transform
                 crs = src.crs
                 bounds = src.bounds
-                
-                if src.count == 1:
-                    img_rgb = np.stack([img_array[0]] * 3, axis=2)
-                elif src.count >= 3:
-                    img_rgb = np.moveaxis(img_array[:3], 0, 2)
-                else:
-                    raise ValueError(f"Неподдерживаемое количество каналов: {src.count}")
-                
-                img_min, img_max = img_rgb.min(), img_rgb.max()
-                if img_max > img_min:
-                    img_rgb = ((img_rgb - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-                else:
-                    img_rgb = img_rgb.astype(np.uint8)
-                
+            
+                # Для SAR используем первый канал.
+                raw_band = src.read(1)
+            
+                # Комплексная амплитуда + asinh + процентили + CLAHE.
+                img_rgb = prepare_sar_for_yolo(
+                    raw_band,
+                    nodata=src.nodata
+                )
+            
+                del raw_band
                 img_height, img_width = img_rgb.shape[:2]
                 pil_image = Image.fromarray(img_rgb)
                 
